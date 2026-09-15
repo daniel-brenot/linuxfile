@@ -3,7 +3,10 @@
 //! The host image grows when you write data and shrinks when trailing space is
 //! freed. The API mirrors `std::fs` (`read`, `write`, `OpenOptions`, `rename`,
 //! …) and also exposes a [`Context`] with file descriptors, `*at` syscalls,
-//! `chdir`, and `chroot` for container-kernel use.
+//! `chdir`, and `chroot` for container-kernel use. Optional LZ4 record
+//! compression (`CreateOptions::compression`) works like ZFS: each 32 KiB
+//! record is compressed independently and stored raw when that would not save
+//! a block.
 //!
 //! # Example
 //!
@@ -20,6 +23,7 @@
 
 mod alloc;
 mod cache;
+mod compress;
 mod context;
 mod crc;
 mod error;
@@ -32,6 +36,7 @@ mod path;
 mod store;
 mod types;
 
+pub use compress::Compression;
 pub use context::Context;
 pub use error::{
     Error, Result, EACCES, EAGAIN, EBADF, EBUSY, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ELOOP,
@@ -69,6 +74,10 @@ pub struct CreateOptions {
     pub initial_blocks: u64,
     pub cache_blocks: usize,
     pub sync: SyncMode,
+    /// Algorithm used for new files. Existing records keep their own algorithm.
+    pub compression: Compression,
+    /// Logical 4 KiB blocks per compression record (clamped to 2..=32, power of two).
+    pub record_blocks: u32,
 }
 
 impl Default for CreateOptions {
@@ -78,6 +87,8 @@ impl Default for CreateOptions {
             initial_blocks: format::DEFAULT_INITIAL_BLOCKS,
             cache_blocks: format::DEFAULT_CACHE_BLOCKS,
             sync: SyncMode::Ordered,
+            compression: Compression::Off,
+            record_blocks: compress::DEFAULT_RECORD_BLOCKS,
         }
     }
 }
@@ -104,6 +115,17 @@ impl CreateOptions {
 
     pub fn sync(mut self, mode: SyncMode) -> Self {
         self.sync = mode;
+        self
+    }
+
+    /// Enable ZFS-style record compression (`Compression::Lz4` is `compression=on`).
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    pub fn record_blocks(mut self, n: u32) -> Self {
+        self.record_blocks = n;
         self
     }
 }
@@ -286,6 +308,110 @@ mod tests {
         f.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"keep");
         drop(f);
+        cleanup(&path);
+    }
+
+    fn tmp_lz4() -> (LinuxFile, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "linuxfile-lz4-{}-{}.img",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let fs = LinuxFile::create_with(
+            &path,
+            CreateOptions::default()
+                .initial_blocks(256)
+                .journal_blocks(32)
+                .cache_blocks(64)
+                .sync(SyncMode::None)
+                .compression(Compression::Lz4),
+        )
+        .unwrap();
+        (fs, path)
+    }
+
+    #[test]
+    fn compression_roundtrip_and_saves_space() {
+        let payload = vec![b'A'; 512 * 1024];
+
+        let (plain, p1) = tmp();
+        plain.write("/big", &payload).unwrap();
+        plain.sync().unwrap();
+        let plain_blocks = plain.metadata("/big").unwrap().stat.blocks;
+        drop(plain);
+
+        let (lz4, p2) = tmp_lz4();
+        assert_eq!(lz4.compression().unwrap(), Compression::Lz4);
+        lz4.write("/big", &payload).unwrap();
+        lz4.sync().unwrap();
+        assert_eq!(lz4.read("/big").unwrap(), payload);
+        let lz4_blocks = lz4.metadata("/big").unwrap().stat.blocks;
+        assert!(
+            lz4_blocks < plain_blocks / 4,
+            "lz4 should store far less: {lz4_blocks} vs {plain_blocks}"
+        );
+        drop(lz4);
+        cleanup(&p1);
+        cleanup(&p2);
+    }
+
+    #[test]
+    fn compression_incompressible_and_partial_overwrite() {
+        let (fs, path) = tmp_lz4();
+        let mut data: Vec<u8> = (0..64 * 1024).map(|i: u32| (i.wrapping_mul(17) % 251) as u8).collect();
+        fs.write("/rand", &data).unwrap();
+        assert_eq!(fs.read("/rand").unwrap(), data);
+
+        data[1000..1100].fill(b'Z');
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        let mut f = fs.open_opts("/rand", &opts).unwrap();
+        f.seek(SeekFrom::Start(1000)).unwrap();
+        f.write_all(&[b'Z'; 100]).unwrap();
+        drop(f);
+        assert_eq!(fs.read("/rand").unwrap(), data);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compression_persist_sparse_truncate() {
+        let (fs, path) = tmp_lz4();
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        let mut f = fs.open_opts("/sparse", &opts).unwrap();
+        f.seek(SeekFrom::Start(1 << 16)).unwrap();
+        f.write_all(&vec![b'B'; 4096]).unwrap();
+        drop(f);
+        assert_eq!(fs.metadata("/sparse").unwrap().len(), (1 << 16) + 4096);
+        let hole = fs.read("/sparse").unwrap();
+        assert!(hole[..1 << 16].iter().all(|&b| b == 0));
+        assert_eq!(&hole[1 << 16..], &vec![b'B'; 4096]);
+
+        fs.truncate("/sparse", 100).unwrap();
+        assert_eq!(fs.metadata("/sparse").unwrap().len(), 100);
+        assert_eq!(fs.read("/sparse").unwrap(), vec![0u8; 100]);
+
+        fs.write("/keep", &vec![b'C'; 8000]).unwrap();
+        fs.sync().unwrap();
+        drop(fs);
+        let fs = LinuxFile::open(&path).unwrap();
+        assert_eq!(fs.file_compression("/keep").unwrap(), Compression::Lz4);
+        assert_eq!(fs.read("/keep").unwrap(), vec![b'C'; 8000]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn set_compression_on_existing_file() {
+        let (fs, path) = tmp();
+        fs.write("/f", &vec![b'D'; 16 * 1024]).unwrap();
+        fs.set_compression("/f", Compression::Lz4).unwrap();
+        assert_eq!(fs.file_compression("/f").unwrap(), Compression::Lz4);
+        fs.write("/f", &vec![b'E'; 64 * 1024]).unwrap();
+        fs.sync().unwrap();
+        assert_eq!(fs.read("/f").unwrap(), vec![b'E'; 64 * 1024]);
+        let blocks = fs.metadata("/f").unwrap().stat.blocks;
+        assert!(blocks < (64 * 1024 / 512), "rewritten file should compress: {blocks}");
         cleanup(&path);
     }
 }

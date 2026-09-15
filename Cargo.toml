@@ -12,6 +12,7 @@ name = "linuxfile"
 path = "src/lib.rs"
 
 [dependencies]
+lz4_flex = "0.14"
 
 [dev-dependencies]
 
