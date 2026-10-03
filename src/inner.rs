@@ -5,11 +5,14 @@ use std::path::Path;
 
 use crate::alloc::{self, Allocator};
 use crate::cache::BlockCache;
+use crate::compress::{
+    self, Compression, RecordHeader, DEFAULT_RECORD_BLOCKS, HEADER_SIZE,
+};
 use crate::error::{self, Result};
 use crate::format::{
-    DataKind, Extent, Inode, Superblock, BLOCK_SIZE, BLOCK_SIZE_U64, FIRST_USER_INO, FLAG_HAS_XATTR,
-    INLINE_MAX, INODES_PER_BLOCK, INODE_SIZE, MAGIC, MAX_DIRECT_EXTENTS, ROOT_INO,
-    VERSION, get_u16, get_u64,
+    get_u16, get_u64, DataKind, Extent, Inode, Superblock, BLOCK_SIZE, BLOCK_SIZE_U64,
+    FEATURE_COMPRESSION, FIRST_USER_INO, FLAG_COMPRESSED, FLAG_HAS_XATTR, INLINE_MAX,
+    INODES_PER_BLOCK, INODE_SIZE, MAGIC, MAX_DIRECT_EXTENTS, ROOT_INO, VERSION,
 };
 use crate::journal::{self, Journal};
 use crate::path::{self, Component, UnixPath, UnixPathBuf, SYMLOOP_MAX};
@@ -34,6 +37,16 @@ pub struct Inner {
     pub writable: bool,
     pub sync_mode: SyncMode,
     pub check_perm: bool,
+    pub default_compression: Compression,
+    pub record_blocks: u32,
+    record_cache: Option<RecordCache>,
+}
+
+struct RecordCache {
+    ino: u64,
+    rec: u64,
+    data: Vec<u8>,
+    dirty: bool,
 }
 
 #[derive(Clone)]
@@ -50,6 +63,12 @@ impl Inner {
         let initial_blocks = opts.initial_blocks.max(first_data as u64 + 8);
         let initial_len = initial_blocks * BLOCK_SIZE_U64;
         let mut image = Image::create(path, initial_len)?;
+        let record_blocks = compress::normalize_record_blocks(opts.record_blocks);
+        let default_compression = opts.compression;
+        let mut features = 0u64;
+        if !default_compression.is_off() {
+            features |= FEATURE_COMPRESSION;
+        }
 
         let mut sb = Superblock {
             magic: MAGIC,
@@ -64,7 +83,7 @@ impl Inner {
             root_ino: ROOT_INO,
             generation: 1,
             uuid: generate_uuid(),
-            features: 0,
+            features,
             mtime: Timespec::now(),
             inode_table_extents: Vec::new(),
             alloc_block: 0,
@@ -72,17 +91,15 @@ impl Inner {
             journal_head: 0,
             journal_tail: 0,
             journal_committed: 0,
+            default_compression: default_compression.as_u8(),
+            record_blocks: record_blocks as u8,
         };
 
         let mut alloc = Allocator::new(first_data as u64, initial_blocks);
         // Inode table: 2 blocks (32 inodes) to start.
         let it_blocks = 2u64;
         let it_start = alloc.allocate(&mut image, it_blocks)?;
-        sb.inode_table_extents.push(Extent {
-            logical: 0,
-            physical: it_start,
-            length: it_blocks as u32,
-        });
+        sb.inode_table_extents.push(Extent::new(0, it_start, it_blocks as u32));
 
         let cache = BlockCache::new(opts.cache_blocks);
         let journal = Journal::new(&sb);
@@ -101,9 +118,13 @@ impl Inner {
             writable: true,
             sync_mode: opts.sync,
             check_perm: false,
+            default_compression,
+            record_blocks,
+            record_cache: None,
         };
 
         let mut root = Inode::new(ROOT_INO, S_IFDIR | 0o755, 0, 0);
+        root.compression = default_compression.as_u8();
         root.nlink = 2;
         inner.write_dir_entries(ROOT_INO, &mut root, &[(ROOT_INO, FileType::Directory, b".".to_vec()), (ROOT_INO, FileType::Directory, b"..".to_vec())])?;
         inner.inodes.insert(ROOT_INO, root);
@@ -133,6 +154,12 @@ impl Inner {
         } else {
             Allocator::new(sb.first_data(), sb.total_blocks)
         };
+        let default_compression = Compression::from_u8(sb.default_compression);
+        let record_blocks = if sb.record_blocks == 0 {
+            DEFAULT_RECORD_BLOCKS
+        } else {
+            compress::normalize_record_blocks(sb.record_blocks as u32)
+        };
         let mut inner = Self {
             journal: Journal::new(&sb),
             cache: BlockCache::new(cache_blocks),
@@ -147,6 +174,9 @@ impl Inner {
             writable,
             sync_mode: sync,
             check_perm: false,
+            default_compression,
+            record_blocks,
+            record_cache: None,
         };
         inner.rebuild_free_inodes()?;
         Ok(inner)
@@ -211,11 +241,7 @@ impl Inner {
                 return Ok(());
             }
         }
-        self.sb.inode_table_extents.push(Extent {
-            logical,
-            physical: start,
-            length: add as u32,
-        });
+        self.sb.inode_table_extents.push(Extent::new(logical, start, add as u32));
         Ok(())
     }
 
@@ -234,6 +260,9 @@ impl Inner {
                 self.load_xattrs(&mut inode)?;
                 if inode.data_kind == DataKind::ExtentTree {
                     self.load_extent_tree(&mut inode)?;
+                }
+                if inode.uses_compression() {
+                    self.resolve_all_extents(&mut inode)?;
                 }
                 Ok(Some(inode))
             }
@@ -300,7 +329,8 @@ impl Inner {
             self.sb.next_inode += 1;
             ino
         };
-        let inode = Inode::new(ino, mode, uid, gid);
+        let mut inode = Inode::new(ino, mode, uid, gid);
+        inode.compression = self.default_compression.as_u8();
         self.inodes.insert(ino, inode);
         self.dirty_inodes.insert(ino);
         self.sb.inode_count += 1;
@@ -308,13 +338,15 @@ impl Inner {
     }
 
     pub fn drop_inode(&mut self, ino: u64) -> Result<()> {
+        self.invalidate_record_cache(ino);
         let inode = self.get_inode(ino)?;
         self.truncate_data(ino, 0)?;
         if inode.xattr_block != 0 {
             self.alloc.free(inode.xattr_block, 1);
         }
+        let tree_blocks = inode.extent_tree_blocks.max(1);
         if inode.extent_tree != 0 && inode.data_kind == DataKind::ExtentTree {
-            self.alloc.free(inode.extent_tree, 1);
+            self.alloc.free(inode.extent_tree, tree_blocks);
         }
         self.inodes.remove(&ino);
         self.dirty_inodes.remove(&ino);
@@ -357,49 +389,106 @@ impl Inner {
         if inode.extent_tree == 0 {
             return Ok(());
         }
-        let block = *self.cache.get(&mut self.image, inode.extent_tree)?;
-        let n = crate::format::get_u32(&block, 0) as usize;
-        let mut off = 8;
+        let first = *self.cache.get(&mut self.image, inode.extent_tree)?;
+        let n = crate::format::get_u32(&first, 0) as usize;
         inode.extents.clear();
-        for _ in 0..n.min(200) {
-            if off + 20 > BLOCK_SIZE as usize {
-                break;
+        if &first[8..12] == b"EXT2" {
+            let nblocks = crate::format::get_u32(&first, 4).max(1) as u64;
+            inode.extent_tree_blocks = nblocks;
+            let per = (BLOCK_SIZE as usize - 16) / 20;
+            let mut remaining = n;
+            for b in 0..nblocks {
+                let block = if b == 0 {
+                    first
+                } else {
+                    *self.cache.get(&mut self.image, inode.extent_tree + b)?
+                };
+                let mut off = if b == 0 { 16 } else { 0 };
+                while remaining > 0 && off + 20 <= BLOCK_SIZE as usize {
+                    inode.extents.push(Extent::new(
+                        crate::format::get_u64(&block, off),
+                        crate::format::get_u64(&block, off + 8),
+                        crate::format::get_u32(&block, off + 16),
+                    ));
+                    off += 20;
+                    remaining -= 1;
+                    if b > 0 && off + 20 > BLOCK_SIZE as usize {
+                        break;
+                    }
+                    if b == 0 && off >= 16 + per * 20 {
+                        break;
+                    }
+                }
             }
-            inode.extents.push(Extent {
-                logical: crate::format::get_u64(&block, off),
-                physical: crate::format::get_u64(&block, off + 8),
-                length: crate::format::get_u32(&block, off + 16),
-            });
-            off += 20;
+        } else {
+            inode.extent_tree_blocks = 1;
+            let mut off = 8;
+            for _ in 0..n.min(200) {
+                if off + 20 > BLOCK_SIZE as usize {
+                    break;
+                }
+                inode.extents.push(Extent::new(
+                    crate::format::get_u64(&first, off),
+                    crate::format::get_u64(&first, off + 8),
+                    crate::format::get_u32(&first, off + 16),
+                ));
+                off += 20;
+            }
         }
         Ok(())
     }
 
     fn store_extent_tree(&mut self, inode: &Inode) -> Result<()> {
+        let old_tree = inode.extent_tree;
+        let old_n = if old_tree != 0 {
+            inode.extent_tree_blocks.max(1)
+        } else {
+            0
+        };
         if inode.extents.len() <= MAX_DIRECT_EXTENTS {
+            if old_tree != 0 {
+                self.alloc.free(old_tree, old_n);
+                if let Some(i) = self.inodes.get_mut(&inode.ino) {
+                    i.extent_tree = 0;
+                    i.extent_tree_blocks = 0;
+                    i.data_kind = DataKind::Extents;
+                }
+            }
             return Ok(());
         }
-        let mut block = [0u8; BLOCK_SIZE as usize];
-        crate::format::put_u32(&mut block, 0, inode.extents.len() as u32);
-        let mut off = 8;
-        for ext in &inode.extents {
-            if off + 20 > BLOCK_SIZE as usize {
-                break;
-            }
-            crate::format::put_u64(&mut block, off, ext.logical);
-            crate::format::put_u64(&mut block, off + 8, ext.physical);
-            crate::format::put_u32(&mut block, off + 16, ext.length);
-            off += 20;
+        let per = (BLOCK_SIZE as usize - 16) / 20;
+        let nblocks = (inode.extents.len().div_ceil(per)).max(1) as u64;
+        if old_tree != 0 {
+            self.alloc.free(old_tree, old_n);
         }
-        let mut tree = inode.extent_tree;
-        if tree == 0 {
-            tree = self.alloc.allocate(&mut self.image, 1)?;
-            if let Some(i) = self.inodes.get_mut(&inode.ino) {
-                i.extent_tree = tree;
-                i.data_kind = DataKind::ExtentTree;
+        let tree = self.alloc.allocate(&mut self.image, nblocks)?;
+        let mut remaining = inode.extents.as_slice();
+        for b in 0..nblocks {
+            let mut block = [0u8; BLOCK_SIZE as usize];
+            let take = remaining.len().min(if b == 0 { per } else { BLOCK_SIZE as usize / 20 });
+            if b == 0 {
+                crate::format::put_u32(&mut block, 0, inode.extents.len() as u32);
+                crate::format::put_u32(&mut block, 4, nblocks as u32);
+                block[8..12].copy_from_slice(b"EXT2");
             }
+            let mut off = if b == 0 { 16 } else { 0 };
+            for ext in &remaining[..take] {
+                if off + 20 > BLOCK_SIZE as usize {
+                    break;
+                }
+                crate::format::put_u64(&mut block, off, ext.logical);
+                crate::format::put_u64(&mut block, off + 8, ext.physical);
+                crate::format::put_u32(&mut block, off + 16, ext.length);
+                off += 20;
+            }
+            remaining = &remaining[take.min(remaining.len())..];
+            self.cache.insert_dirty(&mut self.image, tree + b, block)?;
         }
-        self.cache.insert_dirty(&mut self.image, tree, block)?;
+        if let Some(i) = self.inodes.get_mut(&inode.ino) {
+            i.extent_tree = tree;
+            i.extent_tree_blocks = nblocks;
+            i.data_kind = DataKind::ExtentTree;
+        }
         Ok(())
     }
 
@@ -450,25 +539,44 @@ impl Inner {
         None
     }
 
-    fn add_extent(&mut self, ino: u64, logical: u64, physical: u64, length: u32) -> Result<()> {
+    fn add_extent(
+        &mut self,
+        ino: u64,
+        logical: u64,
+        physical: u64,
+        length: u32,
+        phys_length: u32,
+        compress: u8,
+    ) -> Result<()> {
         let inode = self.get_inode_mut(ino)?;
-        if let Some(last) = inode.extents.last_mut() {
-            if last.logical_end() == logical && last.physical_end() == physical {
+        let merge = compress == 0
+            && phys_length == length
+            && inode
+                .extents
+                .last()
+                .map(|last| {
+                    last.compress == 0
+                        && last.logical_end() == logical
+                        && last.physical + last.phys_len() == physical
+                })
+                .unwrap_or(false);
+        if merge {
+            if let Some(last) = inode.extents.last_mut() {
                 last.length += length;
-                inode.data_kind = if inode.extents.len() > MAX_DIRECT_EXTENTS {
-                    DataKind::ExtentTree
-                } else {
-                    DataKind::Extents
-                };
-                return Ok(());
+                if last.phys_length != 0 {
+                    last.phys_length += phys_length;
+                }
             }
+        } else {
+            inode.extents.push(Extent::with_phys(
+                logical,
+                physical,
+                length,
+                phys_length,
+                compress,
+            ));
+            inode.extents.sort_by_key(|e| e.logical);
         }
-        inode.extents.push(Extent {
-            logical,
-            physical,
-            length,
-        });
-        inode.extents.sort_by_key(|e| e.logical);
         inode.data_kind = if inode.extents.len() > MAX_DIRECT_EXTENTS {
             DataKind::ExtentTree
         } else {
@@ -507,7 +615,7 @@ impl Inner {
             inode.extents.clear();
             inode.blocks = need_blocks * (BLOCK_SIZE_U64 / 512);
         }
-        self.add_extent(ino, 0, phys, need_blocks as u32)?;
+        self.add_extent(ino, 0, phys, need_blocks as u32, need_blocks as u32, 0)?;
         Ok(())
     }
 
@@ -520,13 +628,239 @@ impl Inner {
             self.promote_inline(ino)?;
         }
         let phys = self.alloc.allocate(&mut self.image, 1)?;
-        self.add_extent(ino, logical, phys, 1)?;
+        self.add_extent(ino, logical, phys, 1, 1, 0)?;
         let inode = self.get_inode_mut(ino)?;
         inode.blocks += BLOCK_SIZE_U64 / 512;
         Ok(phys)
     }
 
-    pub fn read_data(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    fn record_bytes(&self) -> u64 {
+        self.record_blocks as u64 * BLOCK_SIZE_U64
+    }
+
+    fn record_index(&self, offset: u64) -> u64 {
+        offset / self.record_bytes()
+    }
+
+    fn invalidate_record_cache(&mut self, ino: u64) {
+        if self.record_cache.as_ref().is_some_and(|c| c.ino == ino) {
+            self.record_cache = None;
+        }
+    }
+
+    pub(crate) fn flush_record_cache(&mut self) -> Result<()> {
+        let Some(cache) = self.record_cache.take() else {
+            return Ok(());
+        };
+        if cache.dirty {
+            self.store_record(cache.ino, cache.rec, &cache.data)?;
+        }
+        Ok(())
+    }
+
+    fn resolve_all_extents(&mut self, inode: &mut Inode) -> Result<()> {
+        for ext in &mut inode.extents {
+            if ext.phys_length != 0 || ext.physical == 0 {
+                continue;
+            }
+            let block = *self.cache.get(&mut self.image, ext.physical)?;
+            if let Some(h) = RecordHeader::parse(&block) {
+                ext.phys_length = h.phys_blocks();
+                ext.compress = h.algo.as_u8();
+            } else {
+                ext.phys_length = ext.length;
+            }
+        }
+        Ok(())
+    }
+
+    fn free_extent_physical(&mut self, ext: &Extent) {
+        self.alloc.free(ext.physical, ext.phys_len());
+    }
+
+    fn punch_logical_range(&mut self, ino: u64, start: u64, end: u64) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let inode = self.get_inode(ino)?;
+        let extents = inode.extents.clone();
+        let mut kept = Vec::new();
+        for ext in extents {
+            let e0 = ext.logical;
+            let e1 = ext.logical_end();
+            if e1 <= start || e0 >= end {
+                kept.push(ext);
+                continue;
+            }
+            if ext.is_compressed() {
+                self.free_extent_physical(&ext);
+                continue;
+            }
+            if e0 < start {
+                let left = (start - e0) as u32;
+                kept.push(Extent::with_phys(
+                    e0,
+                    ext.physical,
+                    left,
+                    left,
+                    0,
+                ));
+            }
+            let mid0 = start.max(e0);
+            let mid1 = end.min(e1);
+            if mid1 > mid0 {
+                self.alloc.free(ext.physical + (mid0 - e0), mid1 - mid0);
+            }
+            if e1 > end {
+                let right = (e1 - end) as u32;
+                kept.push(Extent::with_phys(
+                    end,
+                    ext.physical + (end - e0),
+                    right,
+                    right,
+                    0,
+                ));
+            }
+        }
+        let inode = self.get_inode_mut(ino)?;
+        inode.extents = kept;
+        inode.extents.sort_by_key(|e| e.logical);
+        inode.blocks = inode
+            .extents
+            .iter()
+            .map(|e| e.phys_len() * (BLOCK_SIZE_U64 / 512))
+            .sum();
+        inode.data_kind = if inode.extents.len() > MAX_DIRECT_EXTENTS {
+            DataKind::ExtentTree
+        } else {
+            DataKind::Extents
+        };
+        Ok(())
+    }
+
+    fn write_physical_bytes(&mut self, phys: u64, data: &[u8]) -> Result<()> {
+        let nblocks = (data.len() as u64).div_ceil(BLOCK_SIZE_U64).max(1);
+        for i in 0..nblocks {
+            let mut blk = [0u8; BLOCK_SIZE as usize];
+            let src = (i * BLOCK_SIZE_U64) as usize;
+            if src < data.len() {
+                let n = (data.len() - src).min(BLOCK_SIZE as usize);
+                blk[..n].copy_from_slice(&data[src..src + n]);
+            }
+            self.cache.insert_dirty(&mut self.image, phys + i, blk)?;
+        }
+        Ok(())
+    }
+
+    fn store_record(&mut self, ino: u64, rec: u64, data: &[u8]) -> Result<()> {
+        let rec_blocks = self.record_blocks as u64;
+        let logical = rec * rec_blocks;
+        if data.iter().all(|&b| b == 0) {
+            self.punch_logical_range(ino, logical, logical + rec_blocks)?;
+            return Ok(());
+        }
+        let logical_len = (data.len() as u64).div_ceil(BLOCK_SIZE_U64).max(1) as u32;
+        let algo = Compression::from_u8(self.get_inode(ino)?.compression);
+        let (used, payload) = compress::try_compress(algo, data);
+        if !used.is_off() {
+            let hdr = RecordHeader {
+                algo: used,
+                logical_blocks: logical_len as u16,
+                payload_len: payload.len() as u32,
+                uncompressed_len: data.len() as u32,
+                crc: compress::payload_crc(&payload),
+            };
+            let phys_len = hdr.phys_blocks();
+            let mut raw = vec![0u8; phys_len as usize * BLOCK_SIZE as usize];
+            raw[..HEADER_SIZE].copy_from_slice(&hdr.encode());
+            raw[HEADER_SIZE..HEADER_SIZE + payload.len()].copy_from_slice(&payload);
+            let phys = self.alloc.allocate(&mut self.image, phys_len as u64)?;
+            self.write_physical_bytes(phys, &raw)?;
+            self.punch_logical_range(ino, logical, logical + rec_blocks)?;
+            self.add_extent(ino, logical, phys, logical_len, phys_len, used.as_u8())?;
+            let inode = self.get_inode_mut(ino)?;
+            inode.flags |= FLAG_COMPRESSED;
+        } else {
+            let phys = self.alloc.allocate(&mut self.image, logical_len as u64)?;
+            self.write_physical_bytes(phys, data)?;
+            self.punch_logical_range(ino, logical, logical + rec_blocks)?;
+            self.add_extent(ino, logical, phys, logical_len, logical_len, 0)?;
+        }
+        let inode = self.get_inode_mut(ino)?;
+        inode.blocks = inode
+            .extents
+            .iter()
+            .map(|e| e.phys_len() * (BLOCK_SIZE_U64 / 512))
+            .sum();
+        Ok(())
+    }
+
+    fn read_compressed_extent(&mut self, ext: &Extent) -> Result<Vec<u8>> {
+        let phys_len = ext.phys_len().max(1);
+        let mut raw = vec![0u8; phys_len as usize * BLOCK_SIZE as usize];
+        for i in 0..phys_len {
+            let block = *self.cache.get(&mut self.image, ext.physical + i)?;
+            let dst = (i as usize) * BLOCK_SIZE as usize;
+            raw[dst..dst + BLOCK_SIZE as usize].copy_from_slice(&block);
+        }
+        let hdr = RecordHeader::parse(&raw).ok_or_else(|| error::eio("bad compressed record"))?;
+        let end = HEADER_SIZE + hdr.payload_len as usize;
+        if end > raw.len() {
+            return Err(error::eio("compressed record truncated"));
+        }
+        let payload = &raw[HEADER_SIZE..end];
+        if compress::payload_crc(payload) != hdr.crc {
+            return Err(error::eio("compressed record checksum mismatch"));
+        }
+        compress::decompress(hdr.algo, payload, hdr.uncompressed_len as usize)
+    }
+
+    fn load_record(&mut self, ino: u64, rec: u64) -> Result<Vec<u8>> {
+        let rec_blocks = self.record_blocks as u64;
+        let rec_bytes = self.record_bytes() as usize;
+        let logical = rec * rec_blocks;
+        let inode = self.get_inode(ino)?;
+        let mut buf = vec![0u8; rec_bytes];
+        if let Some(ext) = inode
+            .extents
+            .iter()
+            .copied()
+            .find(|e| e.contains_logical(logical))
+        {
+            if ext.is_compressed() {
+                let data = self.read_compressed_extent(&ext)?;
+                let n = data.len().min(rec_bytes);
+                buf[..n].copy_from_slice(&data[..n]);
+                return Ok(buf);
+            }
+        }
+        let file_off = logical * BLOCK_SIZE_U64;
+        if file_off < inode.size {
+            let n = ((inode.size - file_off) as usize).min(rec_bytes);
+            self.read_data_raw(ino, file_off, &mut buf[..n])?;
+        }
+        Ok(buf)
+    }
+
+    fn cached_record(&mut self, ino: u64, rec: u64) -> Result<&mut RecordCache> {
+        let hit = self
+            .record_cache
+            .as_ref()
+            .is_some_and(|c| c.ino == ino && c.rec == rec);
+        if !hit {
+            self.flush_record_cache()?;
+            let data = self.load_record(ino, rec)?;
+            self.record_cache = Some(RecordCache {
+                ino,
+                rec,
+                data,
+                dirty: false,
+            });
+        }
+        Ok(self.record_cache.as_mut().unwrap())
+    }
+
+    fn read_data_raw(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let inode = self.get_inode(ino)?;
         if offset >= inode.size {
             return Ok(0);
@@ -537,8 +871,7 @@ impl Inner {
         }
         if inode.data_kind == DataKind::Inline {
             let start = offset as usize;
-            let end = start + n;
-            buf[..n].copy_from_slice(&inode.inline_data[start..end]);
+            buf[..n].copy_from_slice(&inode.inline_data[start..start + n]);
             return Ok(n);
         }
         let mut done = 0;
@@ -557,6 +890,88 @@ impl Inner {
             done += chunk;
         }
         Ok(n)
+    }
+
+    fn write_data_raw(&mut self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let inode = self.get_inode(ino)?;
+        if inode.data_kind == DataKind::Inline {
+            self.promote_inline(ino)?;
+        }
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let logical = pos / BLOCK_SIZE_U64;
+            let within = (pos % BLOCK_SIZE_U64) as usize;
+            let chunk = (BLOCK_SIZE as usize - within).min(buf.len() - done);
+            let phys = self.allocate_logical(ino, logical)?;
+            let block = self.cache.get_mut(&mut self.image, phys)?;
+            block[within..within + chunk].copy_from_slice(&buf[done..done + chunk]);
+            done += chunk;
+        }
+        Ok(buf.len())
+    }
+
+    fn write_data_compressed(&mut self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize> {
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let rec = self.record_index(pos);
+            let rec_bytes = self.record_bytes();
+            let within = (pos % rec_bytes) as usize;
+            let chunk = (rec_bytes as usize - within).min(buf.len() - done);
+            {
+                let cache = self.cached_record(ino, rec)?;
+                let need = within + chunk;
+                if cache.data.len() < need {
+                    cache.data.resize(need, 0);
+                }
+                cache.data[within..within + chunk].copy_from_slice(&buf[done..done + chunk]);
+                cache.dirty = true;
+            }
+            done += chunk;
+        }
+        Ok(buf.len())
+    }
+
+    pub fn read_data(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let inode = self.get_inode(ino)?;
+        if offset >= inode.size {
+            return Ok(0);
+        }
+        let n = ((inode.size - offset) as usize).min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        if inode.data_kind == DataKind::Inline {
+            let start = offset as usize;
+            buf[..n].copy_from_slice(&inode.inline_data[start..start + n]);
+            return Ok(n);
+        }
+        if inode.uses_compression() {
+            let mut done = 0;
+            while done < n {
+                let pos = offset + done as u64;
+                let rec = self.record_index(pos);
+                let rec_bytes = self.record_bytes();
+                let within = (pos % rec_bytes) as usize;
+                let chunk = (rec_bytes as usize - within).min(n - done);
+                let cache = self.cached_record(ino, rec)?;
+                let avail = cache.data.len().saturating_sub(within);
+                let take = chunk.min(avail);
+                if take > 0 {
+                    buf[done..done + take].copy_from_slice(&cache.data[within..within + take]);
+                }
+                if take < chunk {
+                    buf[done + take..done + chunk].fill(0);
+                }
+                done += chunk;
+            }
+            return Ok(n);
+        }
+        self.read_data_raw(ino, offset, buf)
     }
 
     pub fn write_data(&mut self, ino: u64, offset: u64, buf: &[u8]) -> Result<usize> {
@@ -585,20 +1000,43 @@ impl Inner {
             inode.touch_mtime();
             return Ok(buf.len());
         }
+        if inode.uses_compression() {
+            if inode.data_kind == DataKind::Inline {
+                let mut full = inode.inline_data.clone();
+                if full.len() < end as usize {
+                    full.resize(end as usize, 0);
+                }
+                full[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
+                {
+                    let inode = self.get_inode_mut(ino)?;
+                    inode.inline_data.clear();
+                    inode.data_kind = DataKind::Extents;
+                    inode.size = end.max(inode.size);
+                    inode.touch_mtime();
+                }
+                let mut off = 0u64;
+                while off < full.len() as u64 {
+                    let rec = self.record_index(off);
+                    let rec_bytes = self.record_bytes() as usize;
+                    let start = off as usize;
+                    let n = (full.len() - start).min(rec_bytes);
+                    self.store_record(ino, rec, &full[start..start + n])?;
+                    off += n as u64;
+                }
+                return Ok(buf.len());
+            }
+            self.write_data_compressed(ino, offset, buf)?;
+            let inode = self.get_inode_mut(ino)?;
+            if end > inode.size {
+                inode.size = end;
+            }
+            inode.touch_mtime();
+            return Ok(buf.len());
+        }
         if inode.data_kind == DataKind::Inline {
             self.promote_inline(ino)?;
         }
-        let mut done = 0;
-        while done < buf.len() {
-            let pos = offset + done as u64;
-            let logical = pos / BLOCK_SIZE_U64;
-            let within = (pos % BLOCK_SIZE_U64) as usize;
-            let chunk = (BLOCK_SIZE as usize - within).min(buf.len() - done);
-            let phys = self.allocate_logical(ino, logical)?;
-            let block = self.cache.get_mut(&mut self.image, phys)?;
-            block[within..within + chunk].copy_from_slice(&buf[done..done + chunk]);
-            done += chunk;
-        }
+        self.write_data_raw(ino, offset, buf)?;
         let inode = self.get_inode_mut(ino)?;
         if end > inode.size {
             inode.size = end;
@@ -612,6 +1050,7 @@ impl Inner {
         if new_size > MAX_SZ {
             return Err(error::Error::from_errno(error::EFBIG));
         }
+        self.flush_record_cache()?;
         let inode = self.get_inode(ino)?;
         if new_size == inode.size {
             return Ok(());
@@ -624,48 +1063,76 @@ impl Inner {
             return Ok(());
         }
         if new_size < inode.size {
-            let first_drop = (new_size + BLOCK_SIZE_U64 - 1) / BLOCK_SIZE_U64;
-            let extents = inode.extents.clone();
-            let mut kept = Vec::new();
-            for ext in extents {
-                if ext.logical_end() <= first_drop {
-                    kept.push(ext);
-                    continue;
+            if inode.uses_compression() {
+                let rec_blocks = self.record_blocks as u64;
+                if new_size == 0 {
+                    let extents = inode.extents.clone();
+                    for ext in extents {
+                        self.free_extent_physical(&ext);
+                    }
+                    let inode = self.get_inode_mut(ino)?;
+                    inode.extents.clear();
+                    inode.size = 0;
+                    inode.blocks = 0;
+                    inode.data_kind = DataKind::Inline;
+                    inode.inline_data.clear();
+                    inode.touch_mtime();
+                    return Ok(());
                 }
-                if ext.logical >= first_drop {
-                    self.alloc.free(ext.physical, ext.length as u64);
-                    continue;
+                let last_off = new_size - 1;
+                let last_rec = self.record_index(last_off);
+                let rec_start = last_rec * rec_blocks;
+                let keep = (new_size - rec_start * BLOCK_SIZE_U64) as usize;
+                let mut rec_data = self.load_record(ino, last_rec)?;
+                rec_data.truncate(keep);
+                self.store_record(ino, last_rec, &rec_data)?;
+                self.punch_logical_range(ino, rec_start + rec_blocks, u64::MAX / 2)?;
+                let inode = self.get_inode_mut(ino)?;
+                inode.size = new_size;
+                inode.touch_mtime();
+            } else {
+                let first_drop = new_size.div_ceil(BLOCK_SIZE_U64);
+                let extents = inode.extents.clone();
+                let mut kept = Vec::new();
+                for ext in extents {
+                    if ext.logical_end() <= first_drop {
+                        kept.push(ext);
+                        continue;
+                    }
+                    if ext.logical >= first_drop {
+                        self.free_extent_physical(&ext);
+                        continue;
+                    }
+                    let keep_len = (first_drop - ext.logical) as u32;
+                    let drop_len = ext.length - keep_len;
+                    self.alloc
+                        .free(ext.physical + keep_len as u64, drop_len as u64);
+                    kept.push(Extent::with_phys(
+                        ext.logical,
+                        ext.physical,
+                        keep_len,
+                        keep_len,
+                        0,
+                    ));
                 }
-                let keep_len = (first_drop - ext.logical) as u32;
-                let drop_len = ext.length - keep_len;
-                self.alloc.free(ext.physical + keep_len as u64, drop_len as u64);
-                kept.push(Extent {
-                    logical: ext.logical,
-                    physical: ext.physical,
-                    length: keep_len,
-                });
-            }
-            let inline = {
                 let inode = self.get_inode_mut(ino)?;
                 inode.extents = kept;
                 inode.size = new_size;
                 inode.blocks = inode
                     .extents
                     .iter()
-                    .map(|e| e.length as u64 * (BLOCK_SIZE_U64 / 512))
+                    .map(|e| e.phys_len() * (BLOCK_SIZE_U64 / 512))
                     .sum();
-                let inline = new_size as usize <= INLINE_MAX && inode.extents.len() <= 1;
-                if !inline {
-                    inode.touch_mtime();
-                }
-                inline
-            };
-            if inline {
+                inode.touch_mtime();
+            }
+            let inode = self.get_inode(ino)?;
+            if new_size as usize <= INLINE_MAX && inode.extents.len() <= 1 {
                 let mut tmp = vec![0u8; new_size as usize];
                 let _ = self.read_data(ino, 0, &mut tmp)?;
+                self.flush_record_cache()?;
                 let extents = self.get_inode(ino)?.extents.clone();
                 for ext in extents {
-                    self.alloc.free(ext.physical, ext.length as u64);
+                    self.free_extent_physical(&ext);
                 }
                 let inode = self.get_inode_mut(ino)?;
                 inode.extents.clear();
@@ -679,6 +1146,18 @@ impl Inner {
             inode.size = new_size;
             inode.touch_mtime();
         }
+        Ok(())
+    }
+
+    pub fn set_inode_compression(&mut self, ino: u64, compression: Compression) -> Result<()> {
+        self.require_write()?;
+        self.flush_record_cache()?;
+        let inode = self.get_inode_mut(ino)?;
+        inode.compression = compression.as_u8();
+        if !compression.is_off() {
+            inode.flags |= FLAG_COMPRESSED;
+        }
+        inode.touch_ctime();
         Ok(())
     }
 
@@ -1238,6 +1717,7 @@ impl Inner {
         if !self.writable {
             return Ok(());
         }
+        self.flush_record_cache()?;
         let dirty: Vec<u64> = self.dirty_inodes.iter().copied().collect();
         if self.sync_mode != SyncMode::None {
             let mut tx = self.journal.begin();
@@ -1282,10 +1762,12 @@ impl Inner {
     }
 
     pub fn flush_cache(&mut self) -> Result<()> {
+        self.flush_record_cache()?;
         self.cache.flush(&mut self.image)
     }
 
     pub fn flush_cache_data(&mut self) -> Result<()> {
+        self.flush_record_cache()?;
         self.cache.flush(&mut self.image)?;
         self.image.sync_data()
     }

@@ -13,7 +13,7 @@ use crate::types::{
     apply_umask, Creds, FileTimes, Metadata, Permissions, Stat, StatFs, S_IFDIR, S_IFIFO,
     S_IFLNK, S_IFREG,
 };
-use crate::{Context, CreateOptions};
+use crate::{Compression, Context, CreateOptions};
 
 /// A mounted Linux filesystem stored in a single host file.
 ///
@@ -66,6 +66,35 @@ impl LinuxFile {
 
     pub fn sync(&self) -> Result<()> {
         self.lock()?.sync()
+    }
+
+    /// Filesystem-wide default compression for new files.
+    pub fn compression(&self) -> Result<Compression> {
+        Ok(self.lock()?.default_compression)
+    }
+
+    /// Logical 4 KiB blocks per compression record.
+    pub fn record_blocks(&self) -> Result<u32> {
+        Ok(self.lock()?.record_blocks)
+    }
+
+    /// Compression algorithm used for new writes to `path`.
+    pub fn file_compression<P: AsRef<UnixPath>>(&self, path: P) -> Result<Compression> {
+        let creds = Self::creds();
+        let mut g = self.lock()?;
+        let r = g.walk(ROOT_INO, ROOT_INO, path.as_ref(), true, &creds)?;
+        let ino = r.ino.ok_or_else(|| error::enoent("no such file or directory"))?;
+        Ok(Compression::from_u8(g.get_inode(ino)?.compression))
+    }
+
+    /// Change the algorithm used for future writes to `path`. Existing records are left as-is
+    /// until they are overwritten (same as ZFS `compression=`).
+    pub fn set_compression<P: AsRef<UnixPath>>(&self, path: P, compression: Compression) -> Result<()> {
+        let creds = Self::creds();
+        let mut g = self.lock()?;
+        let r = g.walk(ROOT_INO, ROOT_INO, path.as_ref(), true, &creds)?;
+        let ino = r.ino.ok_or_else(|| error::enoent("no such file or directory"))?;
+        g.set_inode_compression(ino, compression)
     }
 
     /// Current size of the host image file in bytes.

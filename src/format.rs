@@ -47,6 +47,10 @@ pub struct Superblock {
     pub journal_head: u32,
     pub journal_tail: u32,
     pub journal_committed: u64,
+    /// Default compression algorithm for new inodes (`Compression` as u8).
+    pub default_compression: u8,
+    /// Logical blocks per compression record. 0 means the library default (8).
+    pub record_blocks: u8,
 }
 
 impl Superblock {
@@ -84,6 +88,8 @@ impl Superblock {
         put_u32(&mut buf, 128, self.journal_head);
         put_u32(&mut buf, 132, self.journal_tail);
         put_u64(&mut buf, 136, self.journal_committed);
+        buf[108] = self.default_compression;
+        buf[109] = self.record_blocks;
 
         let n = self.inode_table_extents.len().min(16) as u32;
         put_u32(&mut buf, 144, n);
@@ -126,11 +132,11 @@ impl Superblock {
         let mut inode_table_extents = Vec::with_capacity(n.min(16));
         let mut off = 148;
         for _ in 0..n.min(16) {
-            inode_table_extents.push(Extent {
-                logical: get_u64(buf, off),
-                physical: get_u64(buf, off + 8),
-                length: get_u32(buf, off + 16),
-            });
+            inode_table_extents.push(Extent::new(
+                get_u64(buf, off),
+                get_u64(buf, off + 8),
+                get_u32(buf, off + 16),
+            ));
             off += 20;
         }
         let mut uuid = [0u8; 16];
@@ -159,25 +165,66 @@ impl Superblock {
             journal_head: get_u32(buf, 128),
             journal_tail: get_u32(buf, 132),
             journal_committed: get_u64(buf, 136),
+            default_compression: buf[108],
+            record_blocks: buf[109],
         })
     }
 }
 
 /// File data extent: logical file blocks → physical image blocks.
+///
+/// `length` is always the logical span. Compressed records set `phys_length`
+/// (physical blocks used) and `compress` (algorithm). Both extra fields are
+/// in-memory; on disk they are recovered from the record header. A zero
+/// `phys_length` means "same as `length`" (legacy 1:1 mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
     pub logical: u64,
     pub physical: u64,
     pub length: u32,
+    pub phys_length: u32,
+    pub compress: u8,
 }
 
 impl Extent {
+    pub fn new(logical: u64, physical: u64, length: u32) -> Self {
+        Self {
+            logical,
+            physical,
+            length,
+            phys_length: 0,
+            compress: 0,
+        }
+    }
+
+    pub fn with_phys(logical: u64, physical: u64, length: u32, phys_length: u32, compress: u8) -> Self {
+        Self {
+            logical,
+            physical,
+            length,
+            phys_length,
+            compress,
+        }
+    }
+
+    pub fn phys_len(&self) -> u64 {
+        if self.phys_length != 0 {
+            self.phys_length as u64
+        } else {
+            self.length as u64
+        }
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        self.compress != 0
+    }
+
     pub fn logical_end(&self) -> u64 {
         self.logical + self.length as u64
     }
 
     pub fn physical_end(&self) -> u64 {
-        self.physical + self.length as u64
+        self.physical + self.phys_len()
     }
 
     pub fn contains_logical(&self, block: u64) -> bool {
@@ -228,9 +275,13 @@ pub struct Inode {
     pub flags: u32,
     pub generation: u32,
     pub data_kind: DataKind,
+    /// Algorithm used for new extent-backed writes (`Compression` as u8).
+    pub compression: u8,
     pub inline_data: Vec<u8>,
     pub extents: Vec<Extent>,
     pub extent_tree: u64,
+    /// Number of blocks in the extent-tree allocation (in-memory; stored in the tree header).
+    pub extent_tree_blocks: u64,
     pub xattr_block: u64,
     pub xattr: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -254,9 +305,11 @@ impl Inode {
             flags: 0,
             generation: 1,
             data_kind: DataKind::Inline,
+            compression: 0,
             inline_data: Vec::new(),
             extents: Vec::new(),
             extent_tree: 0,
+            extent_tree_blocks: 0,
             xattr_block: 0,
             xattr: Vec::new(),
         }
@@ -276,6 +329,10 @@ impl Inode {
 
     pub fn is_symlink(&self) -> bool {
         self.file_type().is_symlink()
+    }
+
+    pub fn uses_compression(&self) -> bool {
+        self.compression != 0 || self.flags & FLAG_COMPRESSED != 0
     }
 
     pub fn touch_mtime(&mut self) {
@@ -308,6 +365,7 @@ impl Inode {
         put_u32(&mut buf, 86, self.flags);
         put_u32(&mut buf, 90, self.generation);
         buf[94] = self.data_kind as u8;
+        buf[95] = self.compression;
         put_u64(&mut buf, 96, self.extent_tree);
         put_u64(&mut buf, 240, self.xattr_block);
 
@@ -384,9 +442,11 @@ impl Inode {
             flags: get_u32(buf, 86),
             generation: get_u32(buf, 90),
             data_kind,
+            compression: buf[95],
             inline_data: Vec::new(),
             extents: Vec::new(),
             extent_tree: get_u64(buf, 96),
+            extent_tree_blocks: 0,
             xattr_block: get_u64(buf, 240),
             xattr: Vec::new(),
         };
@@ -401,11 +461,11 @@ impl Inode {
                 let n = n.min(MAX_DIRECT_EXTENTS);
                 let mut off = 106;
                 for _ in 0..n {
-                    inode.extents.push(Extent {
-                        logical: get_u64(buf, off),
-                        physical: get_u64(buf, off + 8),
-                        length: get_u32(buf, off + 16),
-                    });
+                    inode.extents.push(Extent::new(
+                        get_u64(buf, off),
+                        get_u64(buf, off + 8),
+                        get_u32(buf, off + 16),
+                    ));
                     off += 20;
                 }
             }
@@ -419,6 +479,11 @@ pub const FLAG_HAS_XATTR: u32 = 1 << 0;
 pub const FLAG_IMMUTABLE: u32 = 1 << 1;
 #[allow(dead_code)]
 pub const FLAG_APPEND: u32 = 1 << 2;
+/// Inode has (or may have) compressed records; reads must check headers.
+pub const FLAG_COMPRESSED: u32 = 1 << 3;
+
+/// Superblock feature: image understands compression records.
+pub const FEATURE_COMPRESSION: u64 = 1 << 0;
 
 pub fn put_u16(buf: &mut [u8], off: usize, v: u16) {
     buf[off..off + 2].copy_from_slice(&v.to_le_bytes());

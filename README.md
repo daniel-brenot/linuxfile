@@ -25,7 +25,7 @@ That makes it a fit for embedding a Linux root filesystem inside another program
 | Linux extras | xattrs, `mknod` / `mkfifo`, `chmod` / `chown` |
 | Container VFS | `Context` with creds, cwd, root, umask, and an fd table |
 | Reliability | Checksummed superblock + inodes, metadata journal, backup superblock |
-| Performance | Extent allocator, inline small files, write-back block cache |
+| Performance | Extent allocator, inline small files, write-back block cache, optional LZ4 compression |
 
 Paths inside the image are always Unix-style (`/etc/hostname`), on every host OS.
 
@@ -203,7 +203,7 @@ assert!(after < mid);
 ## Creating an image with options
 
 ```rust
-use linuxfile::{CreateOptions, LinuxFile, SyncMode};
+use linuxfile::{Compression, CreateOptions, LinuxFile, SyncMode};
 
 let fs = LinuxFile::create_with(
     "disk.img",
@@ -211,7 +211,8 @@ let fs = LinuxFile::create_with(
         .initial_blocks(1024) // 4 MiB to start (4 KiB blocks)
         .cache_blocks(4096)   // 16 MiB write-back cache
         .journal_blocks(256)  // 1 MiB metadata journal
-        .sync(SyncMode::Ordered),
+        .sync(SyncMode::Ordered)
+        .compression(Compression::Lz4), // ZFS-style record compression
 )?;
 ```
 
@@ -222,6 +223,27 @@ let fs = LinuxFile::create_with(
 | `Full` | `fsync` the image after each metadata transaction. |
 
 Use `Ordered` for a container disk you care about. Use `None` while building an image, then call `sync()` once at the end.
+
+## Compression
+
+Like ZFS, compression is a property of the filesystem (and of each file) rather than a mount option. Each file is split into records (32 KiB by default; up to 128 KiB). A record is compressed with LZ4 and kept only when that saves at least one 4 KiB block. Incompressible records stay raw. All-zero records become holes.
+
+```rust
+use linuxfile::{Compression, CreateOptions, LinuxFile};
+
+let fs = LinuxFile::create_with(
+    "disk.img",
+    CreateOptions::new().compression(Compression::Lz4),
+)?;
+fs.write("/log", &vec![b'x'; 1024 * 1024])?;
+// st_blocks reflects physical space, so a repetitive file uses far less than 1 MiB.
+assert!(fs.metadata("/log")?.stat.blocks < 256);
+
+// Change the algorithm for future writes; existing records stay as they are.
+fs.set_compression("/log", Compression::Off)?;
+```
+
+`Compression::ON` is an alias for `Lz4`, matching ZFS `compression=on`. `LinuxFile::open` reads the algorithm stored in the image; you do not pass it again.
 
 ## How it is laid out
 
@@ -238,6 +260,7 @@ The host file is a small custom filesystem (not ext4):
 - Block size is 4096 bytes; inodes are 256 bytes with CRC32.
 - Files that fit in 128 bytes live in the inode (no extra block).
 - Larger files use extents; holes are not allocated.
+- Optional LZ4 record compression: a 32 KiB record that shrinks by at least 4 KiB is stored compressed.
 - Directories, xattrs, and the free-space map are stored in the same allocator.
 
 You do not mount this with the Linux kernel. All access goes through this crate.
@@ -248,4 +271,4 @@ You do not mount this with the Linux kernel. All access goes through this crate.
 cargo test
 ```
 
-The suite covers create/read/write, directories, symlinks and hard links, sparse files, xattrs/devices, persist + reopen, unlink-while-open, image grow/shrink, and the `Context` fd/`chroot` path.
+The suite covers create/read/write, directories, symlinks and hard links, sparse files, xattrs/devices, persist + reopen, unlink-while-open, image grow/shrink, LZ4 record compression, and the `Context` fd/`chroot` path.
